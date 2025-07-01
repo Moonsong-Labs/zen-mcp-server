@@ -217,6 +217,7 @@ cleanup_docker() {
 
 # Find suitable Python command
 find_python() {
+    local non_interactive="${1:-false}"
     # Pyenv should already be initialized at script start, but check if .python-version exists
     if [[ -f ".python-version" ]] && command -v pyenv &> /dev/null; then
         # Ensure pyenv respects the local .python-version
@@ -262,6 +263,10 @@ find_python() {
             if ! pyenv versions 2>/dev/null | grep -E "3\.(1[2-9]|[2-9][0-9])" >/dev/null; then
                 echo ""
                 echo "Python 3.10+ is required. Pyenv can install Python 3.12 locally for this project."
+                if [[ "$non_interactive" == true ]]; then
+                    print_error "Python 3.10+ not found. Please install Python 3.10 or newer."
+                    return 1
+                fi
                 read -p "Install Python 3.12 using pyenv? (Y/n): " -n 1 -r
                 echo ""
                 if [[ ! $REPLY =~ ^[Nn]$ ]]; then
@@ -279,6 +284,10 @@ find_python() {
                 if [[ ! -f ".python-version" ]] || ! grep -qE "3\.(1[2-9]|[2-9][0-9])" .python-version 2>/dev/null; then
                     echo ""
                     print_info "Python 3.12 is installed via pyenv but not set for this project."
+                    if [[ "$non_interactive" == true ]]; then
+                        print_warning "Skipping pyenv configuration in non-interactive mode"
+                        return 1
+                    fi
                     read -p "Set Python 3.12.0 for this project? (Y/n): " -n 1 -r
                     echo ""
                     if [[ ! $REPLY =~ ^[Nn]$ ]]; then
@@ -512,7 +521,7 @@ bootstrap_pip() {
     print_info "Bootstrapping pip in virtual environment..."
     
     # Try ensurepip first
-    if $venv_python -m ensurepip --default-pip 2>/dev/null; then
+    if $venv_python -m ensurepip --default-pip >/dev/null 2>&1; then
         print_success "Successfully bootstrapped pip using ensurepip"
         return 0
     fi
@@ -560,6 +569,7 @@ bootstrap_pip() {
 
 # Setup environment using uv-first approach
 setup_environment() {
+    local non_interactive="${1:-false}"
     local venv_python=""
     
     # Try uv-first approach
@@ -579,6 +589,17 @@ setup_environment() {
             if venv_python=$(get_venv_python_path "$VENV_PATH"); then
                 touch "$VENV_PATH/uv_created"  # Mark as uv-created
                 print_success "Created environment with uv using Python 3.12"
+                
+                # Ensure pip is installed in uv environment
+                if ! $venv_python -m pip --version &>/dev/null 2>&1; then
+                    print_info "Installing pip in uv environment..."
+                    # uv doesn't install pip by default, use bootstrap method
+                    if bootstrap_pip "$venv_python" "python3"; then
+                        print_success "pip installed in uv environment"
+                    else
+                        print_warning "Failed to install pip in uv environment"
+                    fi
+                fi
             else
                 print_warning "uv succeeded but Python executable not found in venv"
             fi
@@ -589,6 +610,17 @@ setup_environment() {
                 touch "$VENV_PATH/uv_created"  # Mark as uv-created
                 local python_version=$($venv_python --version 2>&1)
                 print_success "Created environment with uv using $python_version"
+                
+                # Ensure pip is installed in uv environment
+                if ! $venv_python -m pip --version &>/dev/null 2>&1; then
+                    print_info "Installing pip in uv environment..."
+                    # uv doesn't install pip by default, use bootstrap method
+                    if bootstrap_pip "$venv_python" "python3"; then
+                        print_success "pip installed in uv environment"
+                    else
+                        print_warning "Failed to install pip in uv environment"
+                    fi
+                fi
             else
                 print_warning "uv succeeded but Python executable not found in venv"
             fi
@@ -604,7 +636,7 @@ setup_environment() {
     if [[ -z "$venv_python" ]]; then
         print_info "Setting up environment with system Python..."
         local python_cmd
-        python_cmd=$(find_python) || return 1
+        python_cmd=$(find_python "$non_interactive") || return 1
         
         # Use existing venv creation logic
         venv_python=$(setup_venv "$python_cmd")
@@ -755,8 +787,10 @@ setup_venv() {
         exit 1
     fi
     
-    # Check if pip exists in the virtual environment (skip check if using uv-created environment)
-    if [[ ! -f "$VENV_PATH/uv_created" ]] && [[ ! -f "$venv_pip" ]] && ! $venv_python -m pip --version &>/dev/null 2>&1; then
+    # Always check if pip exists in the virtual environment (regardless of how it was created)
+    if [[ ! -f "$venv_pip" ]] && ! $venv_python -m pip --version &>/dev/null 2>&1; then
+        print_warning "pip not found in virtual environment, installing..."
+        
         # On Linux, try to install system packages if pip is missing
         local os_type=$(detect_os)
         if [[ "$os_type" == "linux" || "$os_type" == "wsl" ]]; then
@@ -838,8 +872,8 @@ install_dependencies() {
     local python_cmd="$1"
     local deps_needed=false
     
-    # First verify pip is available (skip check if using uv)
-    if [[ ! -f "$VENV_PATH/uv_created" ]] && ! $python_cmd -m pip --version &>/dev/null 2>&1; then
+    # First verify pip is available (always check, even for uv environments)
+    if ! $python_cmd -m pip --version &>/dev/null 2>&1; then
         print_error "pip is not available in the Python environment"
         echo ""
         echo "This indicates an incomplete Python installation."
@@ -1089,8 +1123,12 @@ validate_api_keys() {
 check_claude_cli_integration() {
     local python_cmd="$1"
     local server_path="$2"
+    local non_interactive="${3:-false}"
     
     if ! command -v claude &> /dev/null; then
+        if [[ "$non_interactive" == true ]]; then
+            return 0  # Skip in non-interactive mode
+        fi
         echo ""
         print_warning "Claude CLI not found"
         echo ""
@@ -1151,6 +1189,9 @@ check_claude_cli_integration() {
         fi
     else
         # Not registered at all, ask user if they want to add it
+        if [[ "$non_interactive" == true ]]; then
+            return 0  # Skip in non-interactive mode
+        fi
         echo ""
         read -p "Add Zen to Claude Code? (Y/n): " -n 1 -r
         echo ""
@@ -1177,9 +1218,10 @@ check_claude_cli_integration() {
 check_claude_desktop_integration() {
     local python_cmd="$1"
     local server_path="$2"
+    local non_interactive="${3:-false}"
     
-    # Skip if already configured (check flag)
-    if [[ -f "$DESKTOP_CONFIG_FLAG" ]]; then
+    # Skip if already configured (check flag) or non-interactive
+    if [[ -f "$DESKTOP_CONFIG_FLAG" ]] || [[ "$non_interactive" == true ]]; then
         return 0
     fi
     
@@ -1301,6 +1343,7 @@ EOF
 # Check and update Gemini CLI configuration
 check_gemini_cli_integration() {
     local script_dir="$1"
+    local non_interactive="${2:-false}"
     local zen_wrapper="$script_dir/zen-mcp-server"
     
     # Check if Gemini settings file exists
@@ -1313,6 +1356,11 @@ check_gemini_cli_integration() {
     # Check if zen is already configured
     if grep -q '"zen"' "$gemini_config" 2>/dev/null; then
         # Already configured
+        return 0
+    fi
+    
+    # Skip interactive prompts in non-interactive mode
+    if [[ "$non_interactive" == true ]]; then
         return 0
     fi
     
@@ -1477,7 +1525,7 @@ show_help() {
     echo "$header"
     printf '%*s\n' "${#header}" | tr ' ' '='
     echo ""
-    echo "Usage: $0 [OPTIONS]"
+    echo "Usage: $0 [OPTIONS] [--transport stdio|http] [--host HOST] [--port PORT]"
     echo ""
     echo "Options:"
     echo "  -h, --help      Show this help message"
@@ -1485,13 +1533,20 @@ show_help() {
     echo "  -f, --follow    Follow server logs in real-time"
     echo "  -c, --config    Show configuration instructions for Claude clients"
     echo "  --clear-cache   Clear Python cache and exit (helpful for import issues)"
+    echo "  --non-interactive  Run without prompts (for services/automation)"
+    echo ""
+    echo "Transport Options:"
+    echo "  --transport     Transport mode: stdio (default) or http"
+    echo "  --host          Host to bind HTTP server to (default: 127.0.0.1)"
+    echo "  --port          Port to bind HTTP server to (default: 8000)"
     echo ""
     echo "Examples:"
-    echo "  $0              Setup and start the MCP server"
+    echo "  $0              Setup and run in stdio mode (default)"
     echo "  $0 -f           Setup and follow logs"
     echo "  $0 -c           Show configuration instructions"
-    echo "  $0 --version    Show version only"
-    echo "  $0 --clear-cache Clear Python cache (fixes import issues)"
+    echo "  $0 --transport http          Run in HTTP/SSE mode"
+    echo "  $0 --transport http --host 0.0.0.0 --port 8080"
+    echo "  $0 --transport http --non-interactive   For systemd/services"
     echo ""
     echo "For more information, visit:"
     echo "  https://github.com/BeehiveInnovations/zen-mcp-server"
@@ -1524,49 +1579,98 @@ follow_logs() {
 
 main() {
     # Parse command line arguments
-    local arg="${1:-}"
+    local follow_logs=false
+    local transport="stdio"
+    local host="127.0.0.1"
+    local port="8000"
+    local server_args=""
+    local non_interactive=false
     
-    case "$arg" in
-        -h|--help)
-            show_help
-            exit 0
-            ;;
-        -v|--version)
-            show_version
-            exit 0
-            ;;
-        -c|--config)
-            # Setup minimal environment to get paths for config display
-            echo "Setting up environment for configuration display..."
-            echo ""
-            local python_cmd
-            python_cmd=$(setup_environment) || exit 1
-            local script_dir=$(get_script_dir)
-            local server_path="$script_dir/server.py"
-            display_config_instructions "$python_cmd" "$server_path"
-            exit 0
-            ;;
-        -f|--follow)
-            # Continue with normal setup then follow logs
-            ;;
-        --clear-cache)
-            # Clear cache and exit
-            clear_python_cache
-            print_success "Cache cleared successfully"
-            echo ""
-            echo "You can now run './run-server.sh' normally"
-            exit 0
-            ;;
-        "")
-            # Normal setup without following logs
-            ;;
-        *)
-            print_error "Unknown option: $arg"
-            echo "" >&2
-            show_help
-            exit 1
-            ;;
-    esac
+    # Check if running non-interactively (no TTY)
+    if [[ ! -t 0 ]] || [[ ! -t 1 ]]; then
+        non_interactive=true
+    fi
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -v|--version)
+                show_version
+                exit 0
+                ;;
+            -c|--config)
+                # Setup minimal environment to get paths for config display
+                echo "Setting up environment for configuration display..."
+                echo ""
+                local python_cmd
+                python_cmd=$(setup_environment "$non_interactive") || exit 1
+                local script_dir=$(get_script_dir)
+                local server_path="$script_dir/server.py"
+                display_config_instructions "$python_cmd" "$server_path"
+                exit 0
+                ;;
+            -f|--follow)
+                follow_logs=true
+                shift
+                ;;
+            --clear-cache)
+                # Clear cache and exit
+                clear_python_cache
+                print_success "Cache cleared successfully"
+                echo ""
+                echo "You can now run './run-server.sh' normally"
+                exit 0
+                ;;
+            --non-interactive)
+                non_interactive=true
+                shift
+                ;;
+            --transport)
+                if [[ -n "$2" ]] && [[ "$2" != -* ]]; then
+                    transport="$2"
+                    shift 2
+                else
+                    print_error "Missing value for --transport"
+                    show_help
+                    exit 1
+                fi
+                ;;
+            --host)
+                if [[ -n "$2" ]] && [[ "$2" != -* ]]; then
+                    host="$2"
+                    shift 2
+                else
+                    print_error "Missing value for --host"
+                    show_help
+                    exit 1
+                fi
+                ;;
+            --port)
+                if [[ -n "$2" ]] && [[ "$2" != -* ]]; then
+                    port="$2"
+                    shift 2
+                else
+                    print_error "Missing value for --port"
+                    show_help
+                    exit 1
+                fi
+                ;;
+            *)
+                print_error "Unknown option: $1"
+                echo "" >&2
+                show_help
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Build server arguments
+    if [[ "$transport" == "http" ]]; then
+        server_args="--transport http --host $host --port $port"
+    fi
     
     # Display header
     local main_header="🤖 Zen MCP Server"
@@ -1604,7 +1708,7 @@ main() {
     
     # Step 5: Setup Python environment (uv-first approach)
     local python_cmd
-    python_cmd=$(setup_environment) || exit 1
+    python_cmd=$(setup_environment "$non_interactive") || exit 1
     
     # Step 6: Install dependencies
     install_dependencies "$python_cmd" || exit 1
@@ -1617,26 +1721,58 @@ main() {
     display_setup_instructions "$python_cmd" "$server_path"
     
     # Step 9: Check Claude integrations
-    check_claude_cli_integration "$python_cmd" "$server_path"
-    check_claude_desktop_integration "$python_cmd" "$server_path"
+    check_claude_cli_integration "$python_cmd" "$server_path" "$non_interactive"
+    check_claude_desktop_integration "$python_cmd" "$server_path" "$non_interactive"
     
     # Step 10: Check Gemini CLI integration
-    check_gemini_cli_integration "$script_dir"
+    check_gemini_cli_integration "$script_dir" "$non_interactive"
     
     # Step 11: Display log information
     echo ""
     echo "Logs will be written to: $script_dir/$LOG_DIR/$LOG_FILE"
     echo ""
     
-    # Step 11: Handle command line arguments
-    if [[ "$arg" == "-f" ]] || [[ "$arg" == "--follow" ]]; then
-        follow_logs
-    else
-        echo "To follow logs: ./run-server.sh -f"
-        echo "To show config: ./run-server.sh -c"
-        echo "To update: git pull, then run ./run-server.sh again"
+    # Step 11: Start the server if in HTTP mode
+    if [[ "$transport" == "http" ]]; then
         echo ""
-        echo "Happy coding! 🎉"
+        print_info "Starting Zen MCP Server in HTTP/SSE mode..."
+        echo "Host: $host"
+        echo "Port: $port"
+        echo ""
+        print_info "Server will be available at: http://$host:$port"
+        echo ""
+        
+        # Check if authentication is enabled
+        if [[ "${MCP_REQUIRE_AUTH:-true}" == "true" ]]; then
+            if [[ -z "${MCP_API_KEY:-}" ]] || [[ "${MCP_API_KEY:-}" == "your_secure_api_key_here" ]]; then
+                print_warning "Authentication is enabled but MCP_API_KEY is not set properly!"
+                echo "Please set MCP_API_KEY in your .env file to a secure value."
+                echo ""
+            else
+                print_success "Authentication enabled with API key"
+            fi
+        else
+            print_warning "Authentication is disabled (MCP_REQUIRE_AUTH=false)"
+        fi
+        
+        echo ""
+        print_info "Starting server..."
+        
+        # Execute the server with arguments
+        exec "$python_cmd" "$server_path" $server_args
+    else
+        # Step 12: Handle stdio mode
+        if [[ "$follow_logs" == "true" ]]; then
+            follow_logs
+        else
+            echo "To follow logs: ./run-server.sh -f"
+            echo "To show config: ./run-server.sh -c"
+            echo "To update: git pull, then run ./run-server.sh again"
+            echo ""
+            echo "For remote hosting: ./run-server.sh --transport http"
+            echo ""
+            echo "Happy coding! 🎉"
+        fi
     fi
 }
 
